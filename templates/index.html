@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Car Damage & Tracking AI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-gray-800 min-h-screen">
+
+  <!-- Header -->
+  <header class="bg-white border-b border-gray-200 px-6 py-4">
+    <div class="max-w-5xl mx-auto flex justify-between items-center">
+      <h1 class="text-base font-bold text-gray-900 tracking-tight">00_Car_damage</h1>
+      <span class="text-xs font-medium text-gray-400">AI Damage & Tracking System</span>
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="max-w-5xl mx-auto my-10 px-6">
+    
+    <!-- Tab Navigation -->
+    <div class="flex border-b border-gray-200 mb-8">
+      <button id="tab-damage" type="button" class="py-2 px-4 text-sm font-bold border-b-2 border-black text-black">
+        손상 진단
+      </button>
+      <button id="tab-tracking" type="button" class="py-2 px-4 text-sm font-medium text-gray-400 hover:text-gray-700 transition">
+        가해자 추적
+      </button>
+    </div>
+
+    <!-- Section 1: 차량 손상 진단 -->
+    <section id="section-damage" class="space-y-6">
+      <form action="{{ url_for('predict_damage') }}" method="POST" enctype="multipart/form-data" class="space-y-4">
+        <!-- Upload Box -->
+        <div onclick="document.getElementById('damage-file').click()" class="bg-white border-2 border-dashed border-gray-200 rounded-lg p-10 text-center hover:border-gray-400 transition cursor-pointer">
+          <svg class="mx-auto h-8 w-8 text-gray-400 mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+          </svg>
+          <p id="damage-file-name" class="text-sm font-medium text-gray-600">차량 손상 사진을 클릭하여 업로드하세요</p>
+          <p class="text-xs text-gray-400 mt-1">PNG, JPG 지원</p>
+          <input type="file" id="damage-file" name="file" class="hidden" accept="image/*" onchange="updateFileName(this, 'damage-file-name')">
+        </div>
+
+        <!-- Action Button -->
+        <div class="flex justify-end">
+          <button type="submit" class="bg-black hover:bg-gray-800 text-white text-sm font-medium px-5 py-2.5 rounded-md transition">
+            진단 시작
+          </button>
+        </div>
+      </form>
+
+      <!-- Jinja2: 진단 결과 존재 시에만 렌더링 -->
+      {% if damage_result %}
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6 pt-4">
+        <!-- Result Image -->
+        <div class="bg-white p-5 border border-gray-200 rounded-lg shadow-sm min-w-0">
+          <h3 class="text-sm font-semibold text-gray-900 mb-3">손상 부위 분석 결과</h3>
+          <div class="aspect-video bg-gray-100 rounded border border-gray-100 overflow-hidden flex items-center justify-center">
+            <img src="{{ url_for('static', filename='outputs/' ~ damage_result.output_image) }}" alt="손상 분석 결과" class="w-full h-full object-contain" />
+          </div>
+        </div>
+
+        <!-- Result Report -->
+        <div class="bg-white p-5 border border-gray-200 rounded-lg shadow-sm flex flex-col justify-between min-w-0">
+          <div>
+            <h3 class="text-sm font-semibold text-gray-900 mb-3">AI 수리 솔루션 리포트</h3>
+            <dl class="space-y-3 text-sm">
+              <div class="flex justify-between border-b border-gray-100 pb-2">
+                <dt class="text-gray-500">손상 부위</dt>
+                <dd class="font-medium text-gray-900">{{ damage_result.part }}</dd>
+              </div>
+              <div class="flex justify-between border-b border-gray-100 pb-2">
+                <dt class="text-gray-500">손상 유형</dt>
+                <dd class="font-medium text-gray-900">{{ damage_result.type }}</dd>
+              </div>
+              <div class="flex justify-between border-b border-gray-100 pb-2">
+                <dt class="text-gray-500">권장 수리 방식</dt>
+                <dd class="font-medium text-gray-900">{{ damage_result.repair }}</dd>
+              </div>
+              <div class="flex justify-between pt-1">
+                <dt class="text-gray-500">예상 수리 견적</dt>
+                <dd class="font-bold text-gray-900">{{ damage_result.cost }}</dd>
+              </div>
+            </dl>
+          </div>
+        </div>
+      </div>
+      {% endif %}
+    </section>
+
+    <!-- Section 2: 가해자 추적 -->
+    <section id="section-tracking" class="hidden space-y-6">
+      <form action="{{ url_for('predict_tracking') }}" method="POST" enctype="multipart/form-data" class="space-y-4">
+        <div onclick="document.getElementById('tracking-file').click()" class="bg-white border-2 border-dashed border-gray-200 rounded-lg p-10 text-center hover:border-gray-400 transition cursor-pointer">
+          <p id="tracking-file-name" class="text-sm font-medium text-gray-600">블랙박스 영상 파일(.mp4, .avi)을 업로드하세요</p>
+          <input type="file" id="tracking-file" name="file" class="hidden" accept="video/*" onchange="updateFileName(this, 'tracking-file-name')">
+        </div>
+        <div class="flex justify-end">
+          <button type="submit" class="bg-black hover:bg-gray-800 text-white text-sm font-medium px-5 py-2.5 rounded-md transition">
+            추적 분석 시작
+          </button>
+        </div>
+      </form>
+    </section>
+
+  </main>
+
+  <script>
+    // Tab Toggle Script
+    const tabDamage = document.getElementById('tab-damage');
+    const tabTracking = document.getElementById('tab-tracking');
+    const sectionDamage = document.getElementById('section-damage');
+    const sectionTracking = document.getElementById('section-tracking');
+
+    tabDamage.addEventListener('click', () => {
+      tabDamage.className = 'py-2 px-4 text-sm font-bold border-b-2 border-black text-black';
+      tabTracking.className = 'py-2 px-4 text-sm font-medium text-gray-400 hover:text-gray-700 transition';
+      sectionDamage.classList.remove('hidden');
+      sectionTracking.classList.add('hidden');
+    });
+
+    tabTracking.addEventListener('click', () => {
+      tabTracking.className = 'py-2 px-4 text-sm font-bold border-b-2 border-black text-black';
+      tabDamage.className = 'py-2 px-4 text-sm font-medium text-gray-400 hover:text-gray-700 transition';
+      sectionTracking.classList.remove('hidden');
+      sectionDamage.classList.add('hidden');
+    });
+
+    // File Name Update UI
+    function updateFileName(input, targetId) {
+      if (input.files && input.files[0]) {
+        document.getElementById(targetId).textContent = `선택된 파일: ${input.files[0].name}`;
+      }
+    }
+  </script>
+</body>
+</html>
