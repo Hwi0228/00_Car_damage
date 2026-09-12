@@ -1,5 +1,4 @@
 from flask import Flask, render_template, request
-from google import genai 
 
 app = Flask(__name__)
 
