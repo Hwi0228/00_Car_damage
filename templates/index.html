@@ -93,7 +93,7 @@
     <section id="section-tracking" class="hidden space-y-6">
       <form action="{{ url_for('predict_tracking') }}" method="POST" enctype="multipart/form-data" class="space-y-4">
         <div onclick="document.getElementById('tracking-file').click()" class="bg-white border-2 border-dashed border-gray-200 rounded-lg p-10 text-center hover:border-gray-400 transition cursor-pointer">
-          <p id="tracking-file-name" class="text-sm font-medium text-gray-600">블랙박스 영상 파일(.mp4, .avi)을 업로드하세요</p>
+          <p id="tracking-file-name" class="text-sm font-medium text-gray-600">블랙박스 영상 파일을 업로드하세요</p>
           <input type="file" id="tracking-file" name="file" class="hidden" accept="video/*" onchange="updateFileName(this, 'tracking-file-name')">
         </div>
         <div class="flex justify-end">
