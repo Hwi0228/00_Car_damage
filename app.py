@@ -1,4 +1,5 @@
 from flask import Flask, render_template, request
+from ultralytics import YOLO
 
 app = Flask(__name__)
 
