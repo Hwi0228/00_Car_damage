@@ -1,11 +1,16 @@
-scratch/
-train/*
-!train/prep.py
-!train/extract_dataset.py
-!train/run_scheduled_training.py
-!train/run_training_after_extraction.py
-!train/prepare_part_classifier_colab.py
-!train/train_coin_detector.py
-!train/colab_train_95k.ipynb
-!train/colab_part_classifier_effnetb3.ipynb
-!train/local_part_classifier_effnetb3.ipynb
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Source datasets and generated image crops
+/train/part/
+/train/coin_dataset/
+/train/loaded kor coin.v2i.yolov8.zip
+/train/코랩_부품.zip
+/train/car_damage_runs/*_crops/
+/train/car_damage_runs/effb3_test_30/full_images/
+
+# Model checkpoints larger than GitHub's 100 MB file limit
+/train/effb3.pt
+/train/car_damage_runs/part_classifier_effnetb3/*/best.pt
+/train/car_damage_runs/part_classifier_effnetb3/*/last.pt

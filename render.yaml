@@ -5,5 +5,13 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app
     envVars:
-      - key: GEMINI_API_KEY
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: qwen/qwen3.8-27b
+      - key: DAMAGE_MODEL_PATH
+        sync: false
+      - key: COIN_MODEL_PATH
+        sync: false
+      - key: PART_MODEL_PATH
         sync: false
