@@ -308,11 +308,68 @@
       const scaleX = w / INPUT_SIZE;
       const scaleY = h / INPUT_SIZE;
 
+      // 1. Draw Segmentation Masks
+      if (output1 && output1.length > 0) {
+        detections.forEach(det => {
+          const color = CLASS_COLORS[det.className] || { border: '#eab308' };
+          const maskCanvas = document.createElement('canvas');
+          maskCanvas.width = 80;
+          maskCanvas.height = 80;
+          const maskCtx = maskCanvas.getContext('2d');
+          const maskImgData = maskCtx.createImageData(80, 80);
+
+          const bx1 = Math.max(0, Math.floor(det.x1 / 4));
+          const by1 = Math.max(0, Math.floor(det.y1 / 4));
+          const bx2 = Math.min(80, Math.ceil(det.x2 / 4));
+          const by2 = Math.min(80, Math.ceil(det.y2 / 4));
+
+          const hex = color.border.replace('#', '');
+          const rVal = parseInt(hex.substring(0, 2), 16);
+          const gVal = parseInt(hex.substring(2, 4), 16);
+          const bVal = parseInt(hex.substring(4, 6), 16);
+
+          for (let y = by1; y < by2; y++) {
+            for (let x = bx1; x < bx2; x++) {
+              let sum = 0;
+              const idx80 = y * 80 + x;
+              for (let c = 0; c < 32; c++) {
+                sum += det.maskCoeffs[c] * output1[c * 6400 + idx80];
+              }
+              if (1 / (1 + Math.exp(-sum)) > 0.5) {
+                const pIdx = (y * 80 + x) * 4;
+                maskImgData.data[pIdx] = rVal;
+                maskImgData.data[pIdx + 1] = gVal;
+                maskImgData.data[pIdx + 2] = bVal;
+                maskImgData.data[pIdx + 3] = 140;
+              }
+            }
+          }
+          maskCtx.putImageData(maskImgData, 0, 0);
+          ctx.drawImage(maskCanvas, 0, 0, 80, 80, 0, 0, w, h);
+        });
+      }
+
+      // 2. Draw Bounding Boxes & Labels
       detections.forEach(det => {
-        const color = CLASS_COLORS[det.className];
+        const color = CLASS_COLORS[det.className] || { border: '#eab308' };
+        const x1 = det.x1 * scaleX, y1 = det.y1 * scaleY;
+        const bw = det.w * scaleX, bh = det.h * scaleY;
+
         ctx.strokeStyle = color.border;
         ctx.lineWidth = Math.max(2, Math.round(w / 300));
-        ctx.strokeRect(det.x1 * scaleX, det.y1 * scaleY, det.w * scaleX, det.h * scaleY);
+        ctx.strokeRect(x1, y1, bw, bh);
+
+        // Label Tag
+        const labelText = `${det.classNameKo} ${Math.round(det.score * 100)}%`;
+        const fontSize = Math.max(12, Math.round(w / 50));
+        ctx.font = `bold ${fontSize}px sans-serif`;
+        const textWidth = ctx.measureText(labelText).width;
+
+        ctx.fillStyle = color.border;
+        ctx.fillRect(x1, Math.max(0, y1 - fontSize - 6), textWidth + 10, fontSize + 6);
+
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(labelText, x1 + 5, Math.max(fontSize, y1 - 3));
       });
     }
 
