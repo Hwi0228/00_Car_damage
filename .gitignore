@@ -1,3 +1,6 @@
 scratch/
-train/
+train/*
 !train/prep.py
+!train/extract_dataset.py
+!train/run_scheduled_training.py
+!train/run_training_after_extraction.py
