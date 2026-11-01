@@ -96,6 +96,74 @@ GitHub: https://github.com/Hwi0228/00_Car_damage
   - 동전 데이터:
     - https://universe.roboflow.com/visitor/loaded-kor-coin/dataset/2
 
+## 로컬 동전 감지 모델 학습
+
+`train/loaded kor coin.v2i.yolov8.zip`은 Roboflow Universe의 한국 동전 데이터셋
+(CC BY 4.0, 277장, 10/50/100/500원 4개 클래스)이다. 스크립트가 ZIP을
+`train/coin_dataset/`에 풀고 YOLOv8 설정 경로를 맞춘 뒤 학습한다. 로컬
+`yolov8n.pt`에서 시작하며 기본 설정은 CPU, 416px, batch 8, 최대 15 epoch이고,
+validation 성능이 5 epoch 연속 개선되지 않으면 일찍 멈춘다.
+학습 결과는 `train/coin_runs/` 아래에 저장된다.
+
+```powershell
+python .\train\train_coin_detector.py
+```
+
+`train\damage_extent.pt`는 동전 모델이 아니라 Scratch, Dent, Breakage, Separated
+4개 손상 유형의 세그멘테이션 모델이다. 손상 면적을 cm²로 환산하려면 동전 감지뿐
+아니라 동전 종류(실제 지름)와 사진에서 동전/손상이 같은 평면에 놓였다는 전제도
+필요하다. 동전 모델 학습만으로 면적 환산 기능이 자동으로 추가되는 것은 아니다.
+
+## Colab 표본 학습
+
+전체 원천 데이터를 올리는 대신, 클래스별 표본 데이터와 업로드용 ZIP을 만든다.
+Bandizip CLI(`bz`)가 PATH에 있어야 한다.
+
+```powershell
+python .\train\prep.py --prepare-only --zip-for-colab
+```
+
+기본 설정은 학습 이미지 95,000장과 검증 이미지 23,000장이다. 생성한 업로드 ZIP은
+약 9.38GB이며, 데이터별 이미지 용량에
+따라 달라질 수 있다. 이미지와 라벨 JSON은 파일명 stem으로 짝짓고, 파손 클래스는
+파일명에 포함되지 않아 선택 후보 JSON의 라벨은 8개 스레드로 읽는다. 변환 때는
+이미 읽은 라벨 정보를 재사용한다. 생성되는 `train\yolo_dataset_sample_95k_colab.zip`을
+Google Drive에 올린 뒤, Colab에서 ZIP을 `/content`로 복사해 압축을 풀고 로컬
+런타임 디스크에서 학습한다. ZIP 안의 `data.yaml`은
+`/content/yolo_dataset_sample_95k` 경로를 사용한다. 학습 결과는 런타임이 종료되기
+전에 Drive로 복사한다.
+
+Colab 학습 노트북: [train/colab_train_95k.ipynb](./train/colab_train_95k.ipynb)
+
+## 로컬 손상 부품 분류 학습 (EfficientNet-B3)
+
+`train\part`의 `damage_part` 데이터는 손상 마스크와 차량 부품 마스크가 별도
+annotation으로 제공된다. 분류 노트북은 손상 bbox와 부품 bbox의 겹침 비율로 손상
+crop의 부품 라벨을 정한 뒤 EfficientNet-B3를 학습한다. VS Code에서 저장소를 열고
+로컬 Python 커널로 [train/local_part_classifier_effnetb3.ipynb](./train/local_part_classifier_effnetb3.ipynb)을
+실행한다. 라벨은 앞범퍼, 앞펜더, 전조등, 뒷범퍼, 뒷펜더, 후미등, 옆면(앞/뒤 도어),
+사이드미러, 스텝, 타이어/휠의 10개 그룹으로 묶는다. 데이터에 타이어 전용 라벨이
+없어 타이어와 휠은 한 클래스다. 기본 로컬 학습은 train/validation 라벨 JSON을 최대
+12,000개/4,000개 사용하고, 클래스당 최대 200/50 crop(최대 2,000/500장)을 생성한다.
+ImageNet 사전학습 가중치, 224px 입력, batch 4로 최대 5 epoch 학습하며, validation
+Macro F1이 2 epoch 연속 개선되지 않으면 조기 종료한다. 사전학습 가중치 최초 다운로드를
+제외하고도 CPU 속도에 따라 수십 분 걸릴 수 있다. 체크포인트와 crop은
+`train/car_damage_runs/` 아래에 저장된다. CPU에서 전체 학습 설정으로 전환하지 않는다.
+
+## Colab 부품 분류 학습 (EfficientNet-B3)
+
+로컬 원본 ZIP 네 개는 약 16GB라 Drive에 그대로 올리지 않는다. 전체 annotation에서
+10개 부품 그룹으로 분류되는 손상 crop을 전부 생성한다(train 341,088장,
+validation 60,095장). `python train/prepare_part_classifier_colab.py`를 실행하면
+Bandizip이 `train/car_damage_runs/car_damage_part_crops_10gb.zip`으로 패키징하고
+무결성을 검사한다. 이미 만든 `train/코랩_부품.zip`도 전체 crop 401,183장과 manifest를
+포함하며 무결성 검사를 통과했다. 두 ZIP 중 하나를 서브 Google 계정 Drive의
+`MyDrive/car_damage_part_classifier/`에 올리면 노트북이 자동으로 찾고 내부 폴더 구조도
+처리한다. Colab 노트북
+[train/colab_part_classifier_effnetb3.ipynb](./train/colab_part_classifier_effnetb3.ipynb)을
+GPU 런타임에서 실행한다. 최대 5 epoch, batch 16, ImageNet 사전학습 가중치를 사용하고
+validation Macro F1 기반 조기 종료 및 Drive 체크포인트 저장을 한다.
+
 # 객체 추적
 
 - ⇒ 결국 YOLO 모델에 이동평균 한 것임.

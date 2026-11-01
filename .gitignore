@@ -4,3 +4,8 @@ train/*
 !train/extract_dataset.py
 !train/run_scheduled_training.py
 !train/run_training_after_extraction.py
+!train/prepare_part_classifier_colab.py
+!train/train_coin_detector.py
+!train/colab_train_95k.ipynb
+!train/colab_part_classifier_effnetb3.ipynb
+!train/local_part_classifier_effnetb3.ipynb

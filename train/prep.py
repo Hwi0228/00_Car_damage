@@ -4,15 +4,17 @@ import argparse
 import json
 import math
 import os
+import random
 import shutil
+import subprocess
 import sys
+import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import yaml
 from ultralytics import YOLO
@@ -20,16 +22,16 @@ from ultralytics import YOLO
 
 BASE_DIR = Path(__file__).resolve().parent
 SOURCE_ROOT = BASE_DIR / "data" / "extracted"
-OUTPUT_DIR = BASE_DIR / "yolo_dataset_full"
+OUTPUT_DIR = BASE_DIR / "yolo_dataset_sample_95k"
 RUN_DIR = BASE_DIR / "car_damage_runs"
-RUN_NAME = "aihub_full_until_20261029"
+RUN_NAME = "aihub_sample_95k"
 WEIGHTS = BASE_DIR.parent / "yolov8n-seg.pt"
-SEOUL = ZoneInfo("Asia/Seoul")
-DEADLINE = datetime(2026, 10, 29, 16, 0, tzinfo=SEOUL)
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 CLASS_MAP = {
     "scratch": 0,
+    "scratched": 0,
     "dent": 1,
+    "crushed": 1,
     "breakage": 2,
     "separated": 3,
     "separation": 3,
@@ -41,12 +43,17 @@ CLASS_MAP = {
 CLASS_NAMES = {0: "Scratch", 1: "Dent", 2: "Breakage", 3: "Separated"}
 PROGRESS_INTERVAL = 1000
 MAX_REPORTED_NAMES = 100
+ANNOTATION_WORKERS = 8
 
 
 @dataclass(frozen=True)
 class ImageLabelPair:
     image_path: Path
     annotation_paths: tuple[Path, ...]
+    class_ids: frozenset[int] = frozenset()
+    label_lines: tuple[str, ...] = ()
+    unsupported_damage: tuple[tuple[str, int], ...] = ()
+    invalid_polygons: int = 0
 
 
 def progress(label: str, current: int, total: int, started: float) -> None:
@@ -74,26 +81,6 @@ def find_files(root: Path, extensions: set[str]) -> list[Path]:
     return sorted(files)
 
 
-def metadata_filename(annotation_path: Path) -> str:
-    with annotation_path.open("r", encoding="utf-8-sig") as file:
-        data = json.load(file)
-    image_info = data.get("images", {})
-    if isinstance(image_info, list):
-        if not image_info:
-            raise ValueError(f"No images metadata in {annotation_path}")
-        image_info = image_info[0]
-    if not isinstance(image_info, dict):
-        raise ValueError(f"Invalid images metadata in {annotation_path}")
-    filename = image_info.get("file_name")
-    if not isinstance(filename, str) or not filename.strip():
-        raise ValueError(f"Missing images.file_name in {annotation_path}")
-    filename = filename.strip().replace("\\", "/")
-    member = PurePosixPath(filename)
-    if member.is_absolute() or len(member.parts) != 1 or member.name in {".", ".."}:
-        raise ValueError(f"Unsafe images.file_name in {annotation_path}: {filename}")
-    return member.name
-
-
 def save_report(report_path: Path, report: dict[str, Any]) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
@@ -102,7 +89,122 @@ def save_report(report_path: Path, report: dict[str, Any]) -> None:
     )
 
 
-def pair_split(split: str, report: dict[str, Any]) -> list[ImageLabelPair]:
+def inspect_pair(pair: ImageLabelPair) -> tuple[ImageLabelPair, Counter[str], int]:
+    class_ids: set[int] = set()
+    unsupported_damage: Counter[str] = Counter()
+    invalid_polygons = 0
+    label_lines: list[str] = []
+    for annotation_path in pair.annotation_paths:
+        with annotation_path.open("r", encoding="utf-8-sig") as file:
+            data = json.load(file)
+        image_info = data.get("images", {})
+        if isinstance(image_info, list):
+            if not image_info:
+                raise ValueError(f"No images metadata in {annotation_path}")
+            image_info = image_info[0]
+        if not isinstance(image_info, dict):
+            raise ValueError(f"Invalid images metadata in {annotation_path}")
+        filename = image_info.get("file_name")
+        if not isinstance(filename, str):
+            raise ValueError(f"Missing images.file_name in {annotation_path}")
+        if Path(filename.replace("\\", "/")).name.casefold() != pair.image_path.name.casefold():
+            raise ValueError(
+                f"Annotation/image filename mismatch: {annotation_path} -> {filename}"
+            )
+        width = image_info.get("width")
+        height = image_info.get("height")
+        if not isinstance(width, int) or not isinstance(height, int):
+            raise ValueError(f"Invalid image dimensions in {annotation_path}")
+        annotations = data.get("annotations", [])
+        if not isinstance(annotations, list):
+            raise ValueError(f"Invalid annotations list in {annotation_path}")
+        for annotation in annotations:
+            if not isinstance(annotation, dict):
+                raise ValueError(f"Invalid annotation entry in {annotation_path}")
+            damage = annotation.get("damage")
+            if not isinstance(damage, str):
+                unsupported_damage[str(damage)] += 1
+                continue
+            class_id = CLASS_MAP.get(damage.strip().casefold())
+            if class_id is None:
+                unsupported_damage[damage] += 1
+                continue
+            polygons = normalized_polygons(
+                annotation.get("segmentation"), width, height
+            )
+            if not polygons:
+                invalid_polygons += 1
+                continue
+            class_ids.add(class_id)
+            label_lines.extend(f"{class_id} {polygon}" for polygon in polygons)
+    return (
+        ImageLabelPair(
+            pair.image_path,
+            pair.annotation_paths,
+            frozenset(class_ids),
+            tuple(label_lines),
+            tuple(unsupported_damage.items()),
+            invalid_polygons,
+        ),
+        unsupported_damage,
+        invalid_polygons,
+    )
+
+
+def select_stratified(
+    pairs: list[ImageLabelPair], target: int, seed: int
+) -> list[ImageLabelPair]:
+    grouped: dict[tuple[int, ...], list[ImageLabelPair]] = {}
+    for pair in pairs:
+        if pair.class_ids:
+            key = tuple(sorted(pair.class_ids))
+            grouped.setdefault(key, []).append(pair)
+    if not grouped:
+        raise ValueError("No sampled images contain supported segmentation labels.")
+
+    rng = random.Random(seed)
+    for group in grouped.values():
+        rng.shuffle(group)
+
+    class_counts: Counter[int] = Counter()
+    selected: list[ImageLabelPair] = []
+    class_target = max(1, target // len(CLASS_NAMES))
+    while len(selected) < target:
+        available = [classes for classes, group in grouped.items() if group]
+        if not available:
+            break
+        scores = {
+            classes: sum(
+                max(0, class_target - class_counts[class_id]) / class_target
+                for class_id in classes
+            )
+            for classes in available
+        }
+        best_score = max(scores.values())
+        best_groups = [
+            classes for classes in available if scores[classes] == best_score
+        ]
+        chosen_group = rng.choice(best_groups)
+        pair = grouped[chosen_group].pop()
+        selected.append(pair)
+        class_counts.update(pair.class_ids)
+
+    if len(selected) < target:
+        print(
+            f"Warning: only {len(selected):,} labeled images were available "
+            f"for requested sample size {target:,}."
+        )
+    rng.shuffle(selected)
+    return selected
+
+
+def pair_split(
+    split: str,
+    target: int,
+    seed: int,
+    report: dict[str, Any],
+    candidate_multiplier: float,
+) -> list[ImageLabelPair]:
     image_root = SOURCE_ROOT / split / "images"
     annotation_root = SOURCE_ROOT / split / "annotations"
     images = find_files(image_root, IMAGE_EXTENSIONS)
@@ -110,100 +212,124 @@ def pair_split(split: str, report: dict[str, Any]) -> list[ImageLabelPair]:
     image_index: dict[str, Path] = {}
     duplicate_images: list[str] = []
     for image_path in images:
-        key = image_path.name.casefold()
+        key = image_path.stem.casefold()
         if key in image_index:
             duplicate_images.append(image_path.name)
         else:
             image_index[key] = image_path
 
-    annotations_by_image: dict[str, list[Path]] = {}
-    missing_images: list[str] = []
+    annotations_by_stem: dict[str, list[Path]] = {}
+    duplicate_annotation_stems: list[str] = []
+    for annotation_path in annotations:
+        key = annotation_path.stem.casefold()
+        if key in annotations_by_stem:
+            duplicate_annotation_stems.append(annotation_path.name)
+        annotations_by_stem.setdefault(key, []).append(annotation_path)
+
+    matched_stems = [
+        stem for stem in image_index if stem in annotations_by_stem
+    ]
+    matched_stem_set = set(matched_stems)
+    unmatched_images = set(image_index) - matched_stem_set
+    annotations_missing_images = set(annotations_by_stem) - matched_stem_set
+    candidates = [
+        ImageLabelPair(image_index[key], tuple(annotations_by_stem[key]))
+        for key in matched_stems
+        if len(annotations_by_stem[key]) == 1
+    ]
+    if duplicate_images or duplicate_annotation_stems:
+        raise ValueError(
+            f"{split}: duplicate image/annotation stems found. "
+            "Refusing ambiguous pairing."
+        )
+
+    pool_size = min(
+        len(candidates),
+        max(target, math.ceil(target * candidate_multiplier)),
+    )
+    rng = random.Random(seed)
+    candidate_pool = rng.sample(candidates, pool_size)
+    checked: list[ImageLabelPair] = []
+    unsupported_damage: Counter[str] = Counter()
+    invalid_polygons = 0
     malformed_annotations: list[str] = []
-    filename_disagreements: list[str] = []
-    duplicate_label_stems: list[str] = []
     started = time.monotonic()
-    for index, annotation_path in enumerate(annotations, start=1):
-        try:
-            image_name = metadata_filename(annotation_path)
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
-            malformed_annotations.append(
-                f"{annotation_path.relative_to(annotation_root)}: {error}"
-            )
-            continue
-
-        key = image_name.casefold()
-        image_path = image_index.get(key)
-        if image_path is None:
-            missing_images.append(image_name)
-        else:
-            if annotation_path.stem.casefold() != image_path.stem.casefold():
-                filename_disagreements.append(
-                    f"{annotation_path.name} -> {image_path.name}"
-                )
-            annotations_by_image.setdefault(key, []).append(annotation_path)
-
-        if index % PROGRESS_INTERVAL == 0 or index == len(annotations):
-            progress(f"{split} pairing", index, len(annotations), started)
-    if annotations:
+    with ThreadPoolExecutor(max_workers=ANNOTATION_WORKERS) as executor:
+        for batch_start in range(0, len(candidate_pool), PROGRESS_INTERVAL):
+            batch = candidate_pool[batch_start : batch_start + PROGRESS_INTERVAL]
+            results = executor.map(inspect_pair, batch)
+            for offset, result in enumerate(results, start=batch_start + 1):
+                try:
+                    inspected_pair, unsupported, invalid = result
+                except (
+                    OSError,
+                    UnicodeError,
+                    json.JSONDecodeError,
+                    ValueError,
+                ) as error:
+                    malformed_annotations.append(
+                        f"{candidate_pool[offset - 1].annotation_paths[0].name}: "
+                        f"{error}"
+                    )
+                    continue
+                unsupported_damage.update(unsupported)
+                invalid_polygons += invalid
+                if inspected_pair.class_ids:
+                    checked.append(inspected_pair)
+                if offset % PROGRESS_INTERVAL == 0 or offset == len(candidate_pool):
+                    progress(
+                        f"{split} sample scan",
+                        offset,
+                        len(candidate_pool),
+                        started,
+                    )
+    if candidate_pool:
         sys.stdout.write("\n")
 
-    unmatched_images = sorted(
-        path.name
-        for path in images
-        if path.name.casefold() not in annotations_by_image
-    )
-    duplicate_references = [
-        image_index[key].name
-        for key, paths in annotations_by_image.items()
-        if len(paths) > 1
-    ]
-    image_stems: set[str] = set()
-    pairs: list[ImageLabelPair] = []
-    for image_path in images:
-        key = image_path.name.casefold()
-        annotation_paths = annotations_by_image.get(key)
-        if not annotation_paths:
-            continue
-        stem = image_path.stem.casefold()
-        if stem in image_stems:
-            duplicate_label_stems.append(image_path.stem)
-        image_stems.add(stem)
-        pairs.append(ImageLabelPair(image_path, tuple(annotation_paths)))
+    selected = select_stratified(checked, target, seed)
+    selected_class_counts: Counter[str] = Counter()
+    for pair in selected:
+        selected_class_counts.update(
+            CLASS_NAMES[class_id] for class_id in pair.class_ids
+        )
 
     split_report = {
         "images": len(images),
         "annotation_jsons": len(annotations),
-        "matched_pairs": len(pairs),
+        "matched_pairs_by_filename_stem": len(matched_stems),
         "unmatched_images": len(unmatched_images),
-        "annotations_missing_images": len(missing_images),
+        "annotations_missing_images": len(annotations_missing_images),
         "malformed_annotations": len(malformed_annotations),
         "duplicate_image_names": len(duplicate_images),
-        "images_with_multiple_annotations": len(duplicate_references),
-        "extra_annotations_for_same_image": sum(
-            max(0, len(paths) - 1) for paths in annotations_by_image.values()
-        ),
-        "duplicate_label_stems": len(duplicate_label_stems),
-        "json_filename_disagreements": len(filename_disagreements),
-        "unmatched_image_examples": unmatched_images[:MAX_REPORTED_NAMES],
-        "missing_image_examples": missing_images[:MAX_REPORTED_NAMES],
+        "duplicate_annotation_stems": len(duplicate_annotation_stems),
+        "candidate_pool_size": len(candidate_pool),
+        "valid_labeled_candidates": len(checked),
+        "requested_sample_size": target,
+        "selected_sample_size": len(selected),
+        "selected_class_image_counts": dict(selected_class_counts),
+        "unmatched_image_examples": sorted(unmatched_images)[:MAX_REPORTED_NAMES],
+        "missing_image_examples": sorted(annotations_missing_images)[
+            :MAX_REPORTED_NAMES
+        ],
         "malformed_annotation_examples": malformed_annotations[:MAX_REPORTED_NAMES],
         "duplicate_image_examples": duplicate_images[:MAX_REPORTED_NAMES],
-        "multiple_annotation_image_examples": duplicate_references[
-            :MAX_REPORTED_NAMES
-        ],
-        "duplicate_label_stem_examples": duplicate_label_stems[:MAX_REPORTED_NAMES],
-        "json_filename_disagreement_examples": filename_disagreements[
-            :MAX_REPORTED_NAMES
-        ],
     }
     report["splits"][split] = split_report
     print(
         f"{split}: images={len(images):,}, annotations={len(annotations):,}, "
-        f"matched={len(pairs):,}, images_without_annotation={len(unmatched_images):,}, "
-        f"annotations_without_image={len(missing_images):,}, "
-        f"malformed={len(malformed_annotations):,}"
+        f"stem_matches={len(matched_stems):,}, selected={len(selected):,}/"
+        f"{target:,}, images_without_annotation={len(unmatched_images):,}, "
+        f"annotations_without_image={len(annotations_missing_images):,}, "
+        f"malformed_sample_annotations={len(malformed_annotations):,}, "
+        f"class_image_counts={dict(selected_class_counts)}"
     )
-    return pairs
+    report.setdefault("unsupported_damage_annotations_in_candidate_pool", {})[
+        split
+    ] = dict(unsupported_damage)
+    report.setdefault("invalid_polygons_in_candidate_pool", {})[split] = (
+        invalid_polygons
+    )
+    return selected
 
 
 def polygon_candidates(segmentation: Any) -> list[list[tuple[float, float]]]:
@@ -296,42 +422,12 @@ def create_yolo_dataset(
 
         started = time.monotonic()
         for index, pair in enumerate(pairs, start=1):
-            lines: list[str] = []
-            for annotation_path in pair.annotation_paths:
-                with annotation_path.open("r", encoding="utf-8-sig") as file:
-                    data = json.load(file)
-                image_info = data.get("images", {})
-                if isinstance(image_info, list):
-                    image_info = image_info[0]
-                width = image_info.get("width")
-                height = image_info.get("height")
-                if not isinstance(width, int) or not isinstance(height, int):
-                    raise ValueError(f"Invalid image dimensions in {annotation_path}")
-
-                annotations = data.get("annotations", [])
-                if not isinstance(annotations, list):
-                    raise ValueError(f"Invalid annotations list in {annotation_path}")
-                for annotation in annotations:
-                    if not isinstance(annotation, dict):
-                        raise ValueError(
-                            f"Invalid annotation entry in {annotation_path}"
-                        )
-                    damage = annotation.get("damage")
-                    if not isinstance(damage, str):
-                        unsupported_damage[str(damage)] += 1
-                        continue
-                    class_id = CLASS_MAP.get(damage.strip().casefold())
-                    if class_id is None:
-                        unsupported_damage[damage] += 1
-                        continue
-                    polygons = normalized_polygons(
-                        annotation.get("segmentation"), width, height
-                    )
-                    if not polygons:
-                        invalid_polygons += 1
-                        continue
-                    class_counts[CLASS_NAMES[class_id]] += 1
-                    lines.extend(f"{class_id} {polygon}" for polygon in polygons)
+            lines = pair.label_lines
+            for line in lines:
+                class_id = int(line.partition(" ")[0])
+                class_counts[CLASS_NAMES[class_id]] += 1
+            unsupported_damage.update(dict(pair.unsupported_damage))
+            invalid_polygons += pair.invalid_polygons
 
             if not lines:
                 empty_labels[split] += 1
@@ -378,13 +474,97 @@ def create_yolo_dataset(
     return yaml_path
 
 
+def package_yolo_dataset_for_colab() -> Path:
+    archive_path = OUTPUT_DIR.parent / f"{OUTPUT_DIR.name}_colab.zip"
+    bandizip = shutil.which("bz") or shutil.which("bz.exe")
+    if bandizip is None:
+        raise FileNotFoundError(
+            "Bandizip CLI 'bz' was not found on PATH. Install Bandizip or add bz.exe to PATH."
+        )
+    data_yaml = OUTPUT_DIR / "data.yaml"
+    if not data_yaml.is_file():
+        raise FileNotFoundError(f"YOLO dataset configuration is missing: {data_yaml}")
+    for split in ("train", "validation"):
+        for kind in ("images", "labels"):
+            directory = OUTPUT_DIR / kind / split
+            if not directory.is_dir() or not any(directory.iterdir()):
+                raise FileNotFoundError(
+                    f"YOLO dataset {kind} are missing for {split}: {directory}"
+                )
+
+    started = time.monotonic()
+    original_yaml = data_yaml.read_bytes()
+    data = yaml.safe_load(original_yaml)
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid YOLO dataset configuration: {data_yaml}")
+    data["path"] = f"/content/{OUTPUT_DIR.name}"
+    with tempfile.TemporaryDirectory(
+        prefix=f".{OUTPUT_DIR.name}_colab_",
+        dir=OUTPUT_DIR.parent,
+    ) as temporary_directory:
+        temporary_archive = Path(temporary_directory) / archive_path.name
+        try:
+            data_yaml.write_text(
+                yaml.safe_dump(data, sort_keys=False),
+                encoding="utf-8",
+            )
+            creation = subprocess.run(
+                [
+                    bandizip,
+                    "c",
+                    "-l:0",
+                    "-r",
+                    "-fmt:zip",
+                    str(temporary_archive),
+                    "images",
+                    "labels",
+                    "data.yaml",
+                ],
+                cwd=OUTPUT_DIR,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if creation.returncode != 0:
+                raise RuntimeError(
+                    "Bandizip failed to create the Colab archive "
+                    f"(exit {creation.returncode}):\n"
+                    f"{creation.stdout}\n{creation.stderr}"
+                )
+
+            verification = subprocess.run(
+                [bandizip, "t", str(temporary_archive)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if verification.returncode != 0:
+                raise RuntimeError(
+                    "Bandizip reported an invalid Colab archive "
+                    f"(exit {verification.returncode}):\n"
+                    f"{verification.stdout}\n{verification.stderr}"
+                )
+            temporary_archive.replace(archive_path)
+        finally:
+            data_yaml.write_bytes(original_yaml)
+
+    elapsed = time.monotonic() - started
+    print(f"Colab upload archive: {archive_path}")
+    print(
+        f"Archive size: {archive_path.stat().st_size / 10**9:.2f} GB "
+        f"({archive_path.stat().st_size / 1024**3:.2f} GiB), "
+        f"Bandizip verified in {elapsed:.1f}s"
+    )
+    return archive_path
+
+
 def main() -> int:
     global SOURCE_ROOT, OUTPUT_DIR
 
     parser = argparse.ArgumentParser(
         description=(
             "Pair AI Hub images with annotations, create a YOLO segmentation dataset, "
-            "and train until the fixed Seoul deadline."
+            "and train a deterministic class-balanced sample."
         )
     )
     parser.add_argument(
@@ -398,6 +578,16 @@ def main() -> int:
         help="Check pairings and create the YOLO dataset without starting training.",
     )
     parser.add_argument(
+        "--zip-for-colab",
+        action="store_true",
+        help="Create a portable ZIP of the sampled YOLO dataset for Google Drive upload.",
+    )
+    parser.add_argument(
+        "--train",
+        action="store_true",
+        help="Start local training after preparing the sample dataset.",
+    )
+    parser.add_argument(
         "--source-root",
         type=Path,
         default=SOURCE_ROOT,
@@ -409,151 +599,120 @@ def main() -> int:
         default=OUTPUT_DIR,
         help="Generated YOLO dataset directory.",
     )
+    parser.add_argument(
+        "--train-samples",
+        type=int,
+        default=95000,
+        help="Number of class-balanced training images to use.",
+    )
+    parser.add_argument(
+        "--val-samples",
+        type=int,
+        default=23000,
+        help="Number of class-balanced validation images to use.",
+    )
+    parser.add_argument(
+        "--candidate-multiplier",
+        type=float,
+        default=1.25,
+        help="Random candidate-pool size per requested sample, before class balancing.",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=10,
+        help="Training epochs for the sampled dataset.",
+    )
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     SOURCE_ROOT = args.source_root.resolve()
     OUTPUT_DIR = args.output_dir.resolve()
 
-    now = datetime.now(SEOUL)
-    if now >= DEADLINE:
-        print(f"Training deadline has passed: {DEADLINE.isoformat()}")
-        return 0
-
-    if not args.check_only and (OUTPUT_DIR / "data.yaml").is_file():
-        existing_pairs: dict[str, set[str]] = {}
-        for split in ("train", "validation"):
-            image_dir = OUTPUT_DIR / "images" / split
-            label_dir = OUTPUT_DIR / "labels" / split
-            if not image_dir.is_dir() or not label_dir.is_dir():
-                break
-            image_stems = {
-                path.stem.casefold()
-                for path in image_dir.iterdir()
-                if path.is_file() and path.suffix.casefold() in IMAGE_EXTENSIONS
-            }
-            label_stems = {
-                path.stem.casefold()
-                for path in label_dir.iterdir()
-                if path.is_file() and path.suffix.casefold() == ".txt"
-            }
-            if not image_stems or image_stems != label_stems:
-                break
-            existing_pairs[split] = image_stems
-        existing_config = yaml.safe_load(
-            (OUTPUT_DIR / "data.yaml").read_text(encoding="utf-8")
-        )
-        expected_config = {
-            "path": str(OUTPUT_DIR),
-            "train": "images/train",
-            "val": "images/validation",
-            "names": CLASS_NAMES,
-        }
-        if len(existing_pairs) == 2 and existing_config == expected_config:
-            data_yaml = OUTPUT_DIR / "data.yaml"
-            print(
-                "Using the existing verified YOLO dataset; skipping source "
-                "pairing and conversion so training can resume without recopying."
-            )
-        else:
-            data_yaml = None
-    else:
-        data_yaml = None
+    for name, value in (
+        ("train-samples", args.train_samples),
+        ("val-samples", args.val_samples),
+        ("candidate-multiplier", args.candidate_multiplier),
+        ("epochs", args.epochs),
+    ):
+        if value < 1:
+            parser.error(f"--{name} must be a positive number.")
 
     report: dict[str, Any] = {
         "source_root": str(SOURCE_ROOT),
-        "checked_at": now.isoformat(),
-        "deadline": DEADLINE.isoformat(),
+        "sample_seed": args.seed,
+        "candidate_multiplier": args.candidate_multiplier,
+        "requested_samples": {
+            "train": args.train_samples,
+            "validation": args.val_samples,
+        },
         "splits": {},
     }
-    if data_yaml is None:
-        pairs_by_split = {
-            split: pair_split(split, report) for split in ("train", "validation")
-        }
-        report_path = OUTPUT_DIR / "pairing_report.json"
-        save_report(report_path, report)
-        print(f"Pairing report: {report_path}")
-        if args.check_only:
-            print("Pair check complete; conversion and training were not started.")
-            return 0
-        duplicate_counts = {
-            split: {
-                key: details[key]
-                for key in (
-                    "duplicate_image_names",
-                    "duplicate_label_stems",
-                )
-                if details[key]
-            }
-            for split, details in report["splits"].items()
-        }
-        duplicate_counts = {
-            split: counts for split, counts in duplicate_counts.items() if counts
-        }
-        if duplicate_counts:
-            raise ValueError(
-                f"Duplicate image names or label stems found: {duplicate_counts}. "
-                f"See {report_path}."
-            )
-        empty_splits = [
-            split
-            for split, pairs in pairs_by_split.items()
-            if not pairs
-        ]
-        if empty_splits:
-            raise ValueError(
-                f"No matching image/annotation pairs in: {', '.join(empty_splits)}. "
-                f"See {report_path}."
-            )
-        data_yaml = create_yolo_dataset(pairs_by_split, report)
-        save_report(report_path, report)
-        if args.prepare_only:
-            print("Dataset preparation complete; training was not started.")
-            return 0
-    elif args.check_only:
-        raise FileNotFoundError(
-            "The original source folders are needed for --check-only; "
-            "the existing YOLO dataset alone cannot verify source image/JSON pairing."
+    pairs_by_split = {
+        "train": pair_split(
+            "train",
+            args.train_samples,
+            args.seed,
+            report,
+            args.candidate_multiplier,
+        ),
+        "validation": pair_split(
+            "validation",
+            args.val_samples,
+            args.seed + 1,
+            report,
+            args.candidate_multiplier,
+        ),
+    }
+    report_path = OUTPUT_DIR / "pairing_report.json"
+    save_report(report_path, report)
+    print(f"Sample pairing report: {report_path}")
+    if args.check_only:
+        print("Pair check complete; conversion and training were not started.")
+        return 0
+
+    empty_splits = [split for split, pairs in pairs_by_split.items() if not pairs]
+    if empty_splits:
+        raise ValueError(
+            f"No labeled image/annotation pairs in: {', '.join(empty_splits)}. "
+            f"See {report_path}."
         )
+    data_yaml = create_yolo_dataset(pairs_by_split, report)
+    save_report(report_path, report)
+    if args.zip_for_colab:
+        package_yolo_dataset_for_colab()
+    if args.prepare_only:
+        print("Sample dataset preparation complete; training was not started.")
+        return 0
+    if not args.train:
+        print("Dataset preparation complete; pass --train to start local training.")
+        return 0
 
     if not WEIGHTS.is_file():
         raise FileNotFoundError(f"Pretrained segmentation weights are missing: {WEIGHTS}")
-
-    remaining_seconds = (DEADLINE - datetime.now(SEOUL)).total_seconds()
-    if remaining_seconds <= 0:
-        print("The deadline passed during dataset preparation; training was not started.")
-        return 0
 
     save_dir = RUN_DIR / RUN_NAME
     last_checkpoint = save_dir / "weights" / "last.pt"
     resuming = last_checkpoint.is_file()
     model = YOLO(str(last_checkpoint if resuming else WEIGHTS))
-
-    def stop_at_deadline(trainer: Any) -> None:
-        if datetime.now(SEOUL) >= DEADLINE:
-            trainer.stop = True
-            print(
-                f"\nDeadline reached ({DEADLINE.isoformat()}); "
-                "stopping after this batch and saving the checkpoint."
-            )
-
-    model.add_callback("on_train_batch_end", stop_at_deadline)
     print(
-        f"Starting training at {datetime.now(SEOUL).isoformat()} "
-        f"until {DEADLINE.isoformat()}; resume={resuming}"
+        f"Starting {args.epochs}-epoch training on "
+        f"{len(pairs_by_split['train']):,} train and "
+        f"{len(pairs_by_split['validation']):,} validation images; "
+        f"resume={resuming}"
     )
     model.train(
         data=str(data_yaml),
-        epochs=10000,
-        time=remaining_seconds / 3600,
+        epochs=args.epochs,
         imgsz=320,
         batch=16,
         freeze=10,
-        workers=2,
+        workers=4,
         project=str(RUN_DIR),
         name=RUN_NAME,
         exist_ok=True,
-        seed=0,
+        seed=args.seed,
         amp=True,
-        patience=10000,
+        patience=args.epochs,
         save=True,
         save_period=-1,
         resume=str(last_checkpoint) if resuming else False,
