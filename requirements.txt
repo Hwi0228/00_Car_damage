@@ -1,3 +1,9 @@
 flask==3.0.3
-google-generativeai==0.8.6
 gunicorn
+--extra-index-url https://download.pytorch.org/whl/cpu
+numpy>=1.26,<3
+openai>=1.55,<3
+Pillow>=10,<13
+torch==2.13.0+cpu
+torchvision==0.28.0+cpu
+ultralytics==8.4.148

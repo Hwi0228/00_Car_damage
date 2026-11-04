@@ -5,8 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Car Damage & Tracking System</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <!-- ONNX Runtime Web CDN -->
-  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js"></script>
   <!-- Marked.js -->
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
@@ -45,9 +43,14 @@
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2 2v12a2 2 0 002 2z"/>
           </svg>
           <p id="damage-file-name" class="text-sm font-medium text-gray-600">파일을 업로드하세요</p>
-          <p class="text-xs text-gray-400 mt-1">PNG, JPG 지원</p>
-          <input type="file" id="damage-file" class="hidden" accept="image/*" onchange="handleFileSelect(this)">
+          <p class="text-xs text-gray-400 mt-1">JPG, PNG, WEBP · 최대 15MB</p>
+          <input type="file" id="damage-file" class="hidden" accept="image/jpeg,image/png,image/webp" onchange="handleFileSelect(this)">
         </div>
+        <p class="text-xs leading-relaxed text-gray-500">
+          동전이 탐지되면 실제 지름을 기준으로 cm²로 환산합니다. 실제 동전을 손상 부위와 같은 평면에 놓으세요.
+          동전 오탐이나 평면 차이로 환산 오차가 생길 수 있습니다.
+          사진은 로컬 비전 분석에만 사용하며, Groq에는 사진 없이 분석 결과 텍스트만 전송합니다.
+        </p>
 
         <div class="flex justify-end">
           <button id="btn-submit" type="button" onclick="runInference()"
@@ -64,11 +67,11 @@
         <div class="bg-white p-5 border border-gray-200 rounded-lg shadow-sm min-w-0">
           <h3 class="text-sm font-semibold text-gray-900 mb-3">손상 부위</h3>
           <div class="relative aspect-video bg-gray-100 rounded border border-gray-100 overflow-hidden flex items-center justify-center">
-            <canvas id="output-canvas" class="w-full h-full object-contain"></canvas>
+            <img id="output-image" class="w-full h-full object-contain" alt="손상 탐지 및 동전 후보 결과">
             
             <div id="loading-spinner" class="absolute inset-0 bg-white/80 flex flex-col items-center justify-center hidden">
               <div class="w-6 h-6 border-2 border-black border-t-transparent rounded-full animate-spin mb-2"></div>
-              <span class="text-xs text-gray-600">진단 분석 중...</span>
+              <span id="loading-message" class="text-xs text-gray-600">손상·동전·부품 분석 중...</span>
             </div>
           </div>
         </div>
@@ -87,28 +90,30 @@
                 <dd id="res-type" class="font-medium text-gray-900">-</dd>
               </div>
               <div class="flex justify-between border-b border-gray-100 pb-2">
-                <dt class="text-gray-500">권장 수리 방식</dt>
-                <dd id="res-repair" class="font-medium text-gray-900">-</dd>
+                <dt class="text-gray-500">손상 면적</dt>
+                <dd id="res-area" class="font-medium text-gray-900">-</dd>
               </div>
-              <div class="flex justify-between pt-1">
+              <div class="flex justify-between border-b border-gray-100 pb-2">
                 <dt class="text-gray-500">예상 수리 견적</dt>
-                <dd id="res-cost" class="font-bold text-gray-900">0원</dd>
+                <dd id="res-cost" class="font-bold text-gray-900">-</dd>
               </div>
             </dl>
+            <p id="res-reference" class="mt-3 text-xs leading-relaxed text-gray-500"></p>
+            <p id="res-estimate-note" class="mt-2 text-xs leading-relaxed text-gray-500"></p>
+            <div id="res-details" class="mt-4 space-y-3 text-xs"></div>
           </div>
 
-          <button type="button" onclick="generateGeminiReport()"
+          <button type="button" onclick="generateGroqReport()"
                   class="mt-4 w-full bg-gray-900 hover:bg-black text-white text-xs font-medium py-2 px-3 rounded transition">
-            Gemini AI 리포트 보기
+            Groq AI 리포트 보기
           </button>
         </div>
 
       </div>
 
-      <!-- Gemini Markdown Report Container -->
-      <div id="gemini-report-box" class="bg-white p-6 border border-gray-200 rounded-lg shadow-sm hidden">
-        <h3 class="text-sm font-semibold text-gray-900 mb-3 border-b border-gray-100 pb-2">Gemini AI 정밀 리포트</h3>
-        <div id="gemini-report-content" class="prose prose-sm max-w-none text-gray-700 text-xs leading-relaxed space-y-2">
+      <div id="nim-report-box" class="bg-white p-6 border border-gray-200 rounded-lg shadow-sm hidden">
+        <h3 class="text-sm font-semibold text-gray-900 mb-3 border-b border-gray-100 pb-2">Groq AI 정밀 리포트</h3>
+        <div id="nim-report-content" class="prose prose-sm max-w-none text-gray-700 text-xs leading-relaxed space-y-2">
           <!-- Rendered Markdown -->
         </div>
       </div>
@@ -149,268 +154,135 @@
 
   <!-- Script -->
   <script>
-    const MODEL_PATH = '/static/models/best.onnx';
-    const INPUT_SIZE = 320;
-    const CLASS_NAMES = ['Scratch', 'Dent', 'Breakage', 'Separated'];
-    const CLASS_NAMES_KO = {
-      'Scratch': '스크래치',
-      'Dent': '덴트',
-      'Breakage': '파손',
-      'Separated': '이격'
-    };
-    const CLASS_COLORS = {
-      'Scratch': { border: '#eab308', fill: 'rgba(234, 179, 8, 0.4)' },
-      'Dent': { border: '#3b82f6', fill: 'rgba(59, 130, 246, 0.4)' },
-      'Breakage': { border: '#ef4444', fill: 'rgba(239, 68, 68, 0.4)' },
-      'Separated': { border: '#a855f7', fill: 'rgba(168, 85, 247, 0.4)' }
-    };
-    const REPAIR_SOLUTIONS = {
-      'Scratch': { repair: '붓펜 및 광택 복원', costMin: 50000, costMax: 100000 },
-      'Dent': { repair: 'PDR 덴트 복원', costMin: 100000, costMax: 200000 },
-      'Breakage': { repair: '부품 교체 및 용접', costMin: 250000, costMax: 500000 },
-      'Separated': { repair: '유격 조정 및 재조립', costMin: 80000, costMax: 180000 }
-    };
-
-    let session = null;
-    let selectedImage = null;
     let currentDetections = [];
-
-    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
-
-    async function initONNX() {
-      try {
-        session = await ort.InferenceSession.create(MODEL_PATH, { executionProviders: ['wasm'] });
-      } catch (err) {
-        console.error(err);
-      }
-    }
-    initONNX();
 
     function handleFileSelect(input) {
       if (input.files && input.files[0]) {
-        const file = input.files[0];
-        document.getElementById('damage-file-name').textContent = `선택된 파일: ${file.name}`;
-        const reader = new FileReader();
-        reader.onload = function(e) {
-          const img = new Image();
-          img.onload = function() { selectedImage = img; };
-          img.src = e.target.result;
-        };
-        reader.readAsDataURL(file);
+        document.getElementById('damage-file-name').textContent =
+          `선택된 파일: ${input.files[0].name}`;
       }
     }
 
     async function runInference() {
-      if (!selectedImage) {
+      const file = document.getElementById('damage-file').files[0];
+      if (!file) {
         alert('사진을 먼저 업로드해 주세요.');
         return;
       }
 
       document.getElementById('results-grid').classList.remove('hidden');
       document.getElementById('loading-spinner').classList.remove('hidden');
-
-      await new Promise(r => setTimeout(r, 20));
+      document.getElementById('btn-submit').disabled = true;
+      document.getElementById('loading-message').textContent =
+        '손상·동전·부품 분석 및 Groq 견적 요청 중...';
 
       try {
-        if (!session) session = await ort.InferenceSession.create(MODEL_PATH);
-
-        const tensor = preprocess(selectedImage);
-        const results = await session.run({ images: tensor });
-
-        const detections = postprocess(results.output0.data, 0.25);
-        currentDetections = detections;
-
-        renderVisuals(selectedImage, detections, results.output1.data);
-        renderReport(detections);
-
+        const formData = new FormData();
+        formData.append('image', file);
+        const response = await fetch('/predict/damage', {
+          method: 'POST',
+          body: formData
+        });
+        const result = await response.json();
+        if (!response.ok || !result.success) {
+          throw new Error(result.error || '진단 요청에 실패했습니다.');
+        }
+        currentDetections = result.detections;
+        window.currentRepairEstimate = result.repair_estimate;
+        document.getElementById('output-image').src = result.annotated_image;
+        renderReport(result);
       } catch (err) {
-        console.error(err);
+        alert(`진단 오류: ${err.message}`);
       } finally {
         document.getElementById('loading-spinner').classList.add('hidden');
+        document.getElementById('btn-submit').disabled = false;
       }
     }
 
-    function preprocess(img) {
-      const c = document.createElement('canvas');
-      c.width = INPUT_SIZE; c.height = INPUT_SIZE;
-      const ctx = c.getContext('2d');
-      ctx.drawImage(img, 0, 0, INPUT_SIZE, INPUT_SIZE);
-      const data = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
-      const f32 = new Float32Array(1 * 3 * INPUT_SIZE * INPUT_SIZE);
-      const stride = INPUT_SIZE * INPUT_SIZE;
-      for (let i = 0; i < stride; i++) {
-        f32[i] = data[i * 4] / 255.0;
-        f32[stride + i] = data[i * 4 + 1] / 255.0;
-        f32[stride * 2 + i] = data[i * 4 + 2] / 255.0;
+    function renderReport(result) {
+      const detections = result.detections;
+      const summary = result.summary;
+      const estimate = result.repair_estimate;
+      document.getElementById('res-count').textContent = `${summary.damage_count}건`;
+      document.getElementById('res-type').textContent =
+        summary.damage_types.length
+          ? summary.damage_types.join(', ')
+          : '손상 미감지 (미탐지 가능)';
+      document.getElementById('res-area').textContent =
+        summary.damage_count === 0
+          ? '산출 불가'
+          : summary.total_area_cm2 === null
+          ? `${summary.total_area_pixels.toLocaleString()} px²`
+          : `약 ${summary.total_area_cm2.toFixed(1)} cm²`;
+
+      const cost = document.getElementById('res-cost');
+      const estimateNote = document.getElementById('res-estimate-note');
+      if (estimate.status === 'complete') {
+        cost.textContent =
+          `${estimate.total_min_krw.toLocaleString()}원 ~ ${estimate.total_max_krw.toLocaleString()}원`;
+        const confidence = { low: '낮음', medium: '보통', high: '높음' };
+        estimateNote.textContent =
+          `${estimate.source} · 신뢰도 ${confidence[estimate.confidence] || '미상'} · ${estimate.notes}`;
+      } else {
+        cost.textContent = '견적 산출 불가';
+        estimateNote.textContent =
+          estimate.error || '손상이 검출되지 않았거나 견적을 계산하지 못했습니다.';
       }
-      return new ort.Tensor('float32', f32, [1, 3, INPUT_SIZE, INPUT_SIZE]);
-    }
 
-    function postprocess(output0, thresh) {
-      const anchors = 2100;
-      const boxes = [];
-      for (let i = 0; i < anchors; i++) {
-        const cx = output0[0 * anchors + i];
-        const cy = output0[1 * anchors + i];
-        const w = output0[2 * anchors + i];
-        const h = output0[3 * anchors + i];
-
-        let maxScore = 0, maxClass = -1;
-        for (let c = 0; c < 4; c++) {
-          const score = output0[(4 + c) * anchors + i];
-          if (score > maxScore) { maxScore = score; maxClass = c; }
+      document.getElementById('res-reference').textContent = result.reference.note;
+      const details = document.getElementById('res-details');
+      details.replaceChildren();
+      detections.forEach((item, index) => {
+        const estimateItem = estimate.line_items?.[index];
+        const article = document.createElement('article');
+        article.className = 'border-t border-gray-100 pt-3';
+        const heading = document.createElement('p');
+        heading.className = 'font-semibold text-gray-800';
+        heading.textContent =
+          `${item.class_name_ko} → ${item.part_name} (손상 ${Math.round(item.confidence * 100)}% · 부품 ${Math.round(item.part_confidence * 100)}%)`;
+        const method = document.createElement('p');
+        method.className = 'mt-1 text-gray-600';
+        method.textContent = `권장 방식: ${item.repair}`;
+        const area = document.createElement('p');
+        area.className = 'mt-1 text-gray-500';
+        area.textContent = item.area_cm2 === null
+          ? `마스크 면적 ${item.area_pixels.toLocaleString()} px²`
+          : `마스크 면적 약 ${item.area_cm2.toFixed(1)} cm²`;
+        article.append(heading, method, area);
+        if (estimateItem) {
+          const price = document.createElement('p');
+          price.className = 'mt-1 font-medium text-gray-800';
+          price.textContent =
+            `${estimateItem.repair}: ${estimateItem.min_krw.toLocaleString()}원 ~ ${estimateItem.max_krw.toLocaleString()}원`;
+          const notes = document.createElement('p');
+          notes.className = 'mt-1 text-gray-500';
+          notes.textContent = estimateItem.notes;
+          article.append(price, notes);
         }
-
-        if (maxScore >= thresh) {
-          const coeffs = new Float32Array(32);
-          for (let m = 0; m < 32; m++) coeffs[m] = output0[(8 + m) * anchors + i];
-          boxes.push({
-            x1: cx - w/2, y1: cy - h/2, x2: cx + w/2, y2: cy + h/2,
-            cx, cy, w, h, score: maxScore, classId: maxClass,
-            className: CLASS_NAMES[maxClass], classNameKo: CLASS_NAMES_KO[CLASS_NAMES[maxClass]],
-            maskCoeffs: coeffs
-          });
-        }
-      }
-
-      boxes.sort((a, b) => b.score - a.score);
-      const selected = [];
-      const active = new Array(boxes.length).fill(true);
-      for (let i = 0; i < boxes.length; i++) {
-        if (!active[i]) continue;
-        selected.push(boxes[i]);
-        for (let j = i + 1; j < boxes.length; j++) {
-          if (active[j] && boxes[i].classId === boxes[j].classId && iou(boxes[i], boxes[j]) > 0.45) {
-            active[j] = false;
-          }
-        }
-      }
-      return selected;
-    }
-
-    function iou(b1, b2) {
-      const ix1 = Math.max(b1.x1, b2.x1), iy1 = Math.max(b1.y1, b2.y1);
-      const ix2 = Math.min(b1.x2, b2.x2), iy2 = Math.min(b1.y2, b2.y2);
-      const inter = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1);
-      const a1 = (b1.x2 - b1.x1) * (b1.y2 - b1.y1);
-      const a2 = (b2.x2 - b2.x1) * (b2.y2 - b2.y1);
-      return inter / (a1 + a2 - inter + 1e-6);
-    }
-
-    function renderVisuals(img, detections, output1) {
-      const canvas = document.getElementById('output-canvas');
-      const w = img.naturalWidth || img.width;
-      const h = img.naturalHeight || img.height;
-      canvas.width = w; canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0, w, h);
-
-      const scaleX = w / INPUT_SIZE;
-      const scaleY = h / INPUT_SIZE;
-
-      // 1. Draw Segmentation Masks
-      if (output1 && output1.length > 0) {
-        detections.forEach(det => {
-          const color = CLASS_COLORS[det.className] || { border: '#eab308' };
-          const maskCanvas = document.createElement('canvas');
-          maskCanvas.width = 80;
-          maskCanvas.height = 80;
-          const maskCtx = maskCanvas.getContext('2d');
-          const maskImgData = maskCtx.createImageData(80, 80);
-
-          const bx1 = Math.max(0, Math.floor(det.x1 / 4));
-          const by1 = Math.max(0, Math.floor(det.y1 / 4));
-          const bx2 = Math.min(80, Math.ceil(det.x2 / 4));
-          const by2 = Math.min(80, Math.ceil(det.y2 / 4));
-
-          const hex = color.border.replace('#', '');
-          const rVal = parseInt(hex.substring(0, 2), 16);
-          const gVal = parseInt(hex.substring(2, 4), 16);
-          const bVal = parseInt(hex.substring(4, 6), 16);
-
-          for (let y = by1; y < by2; y++) {
-            for (let x = bx1; x < bx2; x++) {
-              let sum = 0;
-              const idx80 = y * 80 + x;
-              for (let c = 0; c < 32; c++) {
-                sum += det.maskCoeffs[c] * output1[c * 6400 + idx80];
-              }
-              if (1 / (1 + Math.exp(-sum)) > 0.5) {
-                const pIdx = (y * 80 + x) * 4;
-                maskImgData.data[pIdx] = rVal;
-                maskImgData.data[pIdx + 1] = gVal;
-                maskImgData.data[pIdx + 2] = bVal;
-                maskImgData.data[pIdx + 3] = 140;
-              }
-            }
-          }
-          maskCtx.putImageData(maskImgData, 0, 0);
-          ctx.drawImage(maskCanvas, 0, 0, 80, 80, 0, 0, w, h);
-        });
-      }
-
-      // 2. Draw Bounding Boxes & Labels
-      detections.forEach(det => {
-        const color = CLASS_COLORS[det.className] || { border: '#eab308' };
-        const x1 = det.x1 * scaleX, y1 = det.y1 * scaleY;
-        const bw = det.w * scaleX, bh = det.h * scaleY;
-
-        ctx.strokeStyle = color.border;
-        ctx.lineWidth = Math.max(2, Math.round(w / 300));
-        ctx.strokeRect(x1, y1, bw, bh);
-
-        // Label Tag
-        const labelText = `${det.classNameKo} ${Math.round(det.score * 100)}%`;
-        const fontSize = Math.max(12, Math.round(w / 50));
-        ctx.font = `bold ${fontSize}px sans-serif`;
-        const textWidth = ctx.measureText(labelText).width;
-
-        ctx.fillStyle = color.border;
-        ctx.fillRect(x1, Math.max(0, y1 - fontSize - 6), textWidth + 10, fontSize + 6);
-
-        ctx.fillStyle = '#ffffff';
-        ctx.fillText(labelText, x1 + 5, Math.max(fontSize, y1 - 3));
+        details.append(article);
       });
     }
 
-    function renderReport(detections) {
-      document.getElementById('res-count').textContent = `${detections.length}건`;
-      if (detections.length === 0) {
-        document.getElementById('res-type').textContent = '없음';
-        document.getElementById('res-repair').textContent = '해당 없음';
-        document.getElementById('res-cost').textContent = '0원';
-        return;
-      }
-
-      const types = [...new Set(detections.map(d => d.classNameKo))].join(', ');
-      document.getElementById('res-type').textContent = types;
-
-      let minSum = 0, maxSum = 0;
-      detections.forEach(d => {
-        const sol = REPAIR_SOLUTIONS[d.className];
-        minSum += sol.costMin; maxSum += sol.costMax;
-      });
-
-      document.getElementById('res-repair').textContent = REPAIR_SOLUTIONS[detections[0].className].repair;
-      document.getElementById('res-cost').textContent = `약 ${minSum.toLocaleString()}원 ~ ${maxSum.toLocaleString()}원`;
-    }
-
-    async function generateGeminiReport() {
-      const box = document.getElementById('gemini-report-box');
-      const content = document.getElementById('gemini-report-content');
+    async function generateGroqReport() {
+      const box = document.getElementById('nim-report-box');
+      const content = document.getElementById('nim-report-content');
       box.classList.remove('hidden');
-      content.innerHTML = 'Gemini AI 분석 리포트 생성 중...';
+      content.textContent = 'Groq AI 분석 리포트 생성 중...';
 
       try {
-        const resp = await fetch('/api/generate-gemini-report', {
+        const resp = await fetch('/api/generate-groq-report', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ detections: currentDetections })
+          body: JSON.stringify({
+            detections: currentDetections,
+            repair_estimate: window.currentRepairEstimate || {}
+          })
         });
         const data = await resp.json();
+        if (!resp.ok || !data.success) throw new Error(data.error || '리포트 생성 실패');
         content.innerHTML = marked.parse(data.report);
       } catch (err) {
-        content.innerHTML = '리포트 생성 오류: ' + err.message;
+        content.textContent = '리포트 생성 오류: ' + err.message;
       }
     }
 
@@ -420,7 +292,8 @@
 
     function updateFileName(input, targetId) {
       if (input.files && input.files[0]) {
-        document.getElementById(targetId).textContent = `선택된 파일: ${file.name}`;
+        document.getElementById(targetId).textContent =
+          `선택된 파일: ${input.files[0].name}`;
       }
     }
 
